@@ -1,0 +1,33 @@
+# 다음 수집 릴레이 — 워커가 실패 시 repository_dispatch로 원격 기동한다.
+# 역할은 "멍청한 운반책": HTML을 받아 워커 /collect/daum-html 로 전달만 한다.
+# 파싱·검증·저장은 전부 워커 담당 — 이 저장소에는 파서가 없다 (이중화 방지).
+name: daum-relay
+
+on:
+  repository_dispatch:
+    types: [collect-daum]
+  workflow_dispatch: {}   # 수동 테스트용 (Actions 탭에서 Run workflow)
+
+permissions: {}           # 저장소 권한 불필요
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: fetch daum and push to worker
+        env:
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 워커와 동일한 식별 UA — 수집 위치가 바뀌어도 행동 강령은 동일
+          curl -sS --max-time 20 \
+            -H "Accept: text/html" -H "Accept-Language: ko-KR,ko;q=0.9" \
+            "https://www.daum.net" -o daum.html
+          size=$(wc -c < daum.html)
+          echo "fetched ${size} bytes"
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer ${EXPORT_TOKEN}" \
+            -H "Content-Type: text/html; charset=utf-8" \
+            --data-binary @daum.html \
+            "https://trend-collector.trend-collect.workers.dev/collect/daum-html"
