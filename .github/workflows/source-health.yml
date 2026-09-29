@@ -1,0 +1,77 @@
+# 수집 소스 헬스 감시 — 이상이 있으면 워크플로가 실패하고 GitHub이 메일로 알린다.
+# 배경: 2026-09 줌 파서가 4일간(연속 실패 189회) 깨져 있었는데 아무도 몰랐다.
+#
+# 판정 2종 (둘 중 하나라도 걸리면 실패):
+#  1) 연속 실패 — consecutive_failures가 ALERT_HOURS(3시간) 분량 이상
+#     (10분 주기 소스 18회 / 30분 주기 소스 6회)
+#  2) 수집 정지 — last_attempt_at이 3시간 넘게 멈춤. 크론이 중간에 죽으면
+#     실패 기록조차 안 쌓여 1)로는 못 잡는다 (2026-08-17 CPU 장애 유형)
+#
+# /health는 공개 엔드포인트라 시크릿 불필요.
+# 소스를 추가·삭제하면 아래 SOURCES도 함께 갱신할 것.
+name: source-health
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # 매시 17분 (정각 혼잡 회피)
+  workflow_dispatch: {}   # 수동 실행 (Actions 탭 → Run workflow)
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: check all sources
+        run: |
+          # 수집 소스 헬스 감시 — 이상이 있으면 exit 1 (GitHub이 실패 메일 발송)
+          # 판정 2종:
+          #  1) 연속 실패: consecutive_failures가 ALERT_HOURS 분량을 넘음 (예: 줌 파서 깨짐)
+          #  2) 수집 정지: last_attempt_at이 ALERT_HOURS보다 오래됨 (예: 크론이 중간에 죽어
+          #     실패 기록조차 안 쌓이는 경우 — 연속 실패만 보면 못 잡는다)
+          set -uo pipefail
+
+          BASE="${BASE:-https://trend-collector.trend-collect.workers.dev}"
+          ALERT_HOURS="${ALERT_HOURS:-3}"
+          # 소스:수집주기(분)
+          SOURCES="${SOURCES:-google:10 daum:10 khan:30 sbs:30 newsis:30 newsis2:30 donga:30 sbs2:30 hankyung:30 chosun:30 hani:30 zum:30 nate:30}"
+          NOW="${NOW:-$(date -u +%s)}"
+          KST_HOUR="${KST_HOUR:-$(TZ=Asia/Seoul date +%-H)}"
+
+          fetch() { curl -s --max-time 15 "$BASE/health?src=$1"; }
+
+          bad=0
+          summary="| 소스 | 상태 | 연속실패 | 마지막 시도 |\n|---|---|---|---|\n"
+          for pair in $SOURCES; do
+            src="${pair%%:*}"; every="${pair##*:}"
+            limit=$(( ALERT_HOURS * 60 / every ))
+            body="$(fetch "$src")"
+            if [ -z "$body" ] || ! echo "$body" | jq -e . >/dev/null 2>&1; then
+              echo "::error::$src — 응답 없음/JSON 아님"; bad=1
+              summary+="| $src | ❌ 응답 없음 | - | - |\n"; continue
+            fi
+            last="$(echo "$body" | jq -r '.last_attempt_at // empty')"
+            if [ -z "$last" ]; then
+              echo "::error::$src — 수집 기록 없음 ($(echo "$body" | jq -r '.error // "?"'))"; bad=1
+              summary+="| $src | ❌ 기록 없음 | - | - |\n"; continue
+            fi
+            fails="$(echo "$body" | jq -r '.consecutive_failures // 0')"
+            err="$(echo "$body" | jq -r '.error // ""')"
+            age_min=$(( (NOW - $(date -u -d "$last" +%s)) / 60 ))
+
+            status="✅"
+            if [ "$fails" -ge "$limit" ]; then
+              echo "::error::$src — 연속 실패 ${fails}회 (한도 ${limit}) · ${err}"; bad=1; status="❌ 연속 실패"
+            fi
+            # 다음은 KST 01~06시 휴면이라 시도 자체가 없다 → 그 시간대엔 정지 판정 제외
+            dormant_exempt=0
+            if [ "$src" = "daum" ] && [ "$KST_HOUR" -ge 1 ] && [ "$KST_HOUR" -le 6 ]; then dormant_exempt=1; fi
+            if [ "$age_min" -gt $(( ALERT_HOURS * 60 )) ] && [ "$dormant_exempt" -eq 0 ]; then
+              echo "::error::$src — ${age_min}분째 수집 시도 없음 (크론 정지 의심)"; bad=1; status="❌ 수집 정지"
+            fi
+            summary+="| $src | $status | $fails | ${age_min}분 전 |\n"
+          done
+
+          printf "%b" "$summary" > "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          exit $bad
